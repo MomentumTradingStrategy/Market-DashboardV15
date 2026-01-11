@@ -1,7 +1,7 @@
 import os
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import time
+import threading
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import requests
@@ -16,8 +16,9 @@ st.set_page_config(page_title="Relative Strength Scanner", layout="wide")
 CSV_FILE = "Tickers.csv"
 BENCHMARK = "SPY"
 
-# Lookback: need enough trading days for 1Y (252). 420 calendar days is usually safe.
-LOOKBACK_CAL_DAYS = 420
+# Alpha Vantage free tier is typically 5 calls/minute.
+# If you have a higher tier, raise this (e.g., 30, 75, 150, etc.)
+CALLS_PER_MINUTE = 5
 
 # RS horizons (trading days)
 HORIZONS = {
@@ -28,17 +29,21 @@ HORIZONS = {
     "RS 1Y": 252,
 }
 
-# Get API key securely (preferred order)
-# 1) Streamlit secrets: st.secrets["POLYGON_API_KEY"]
-# 2) Environment variable: POLYGON_API_KEY
+
+# ============================================================
+# API KEY
+# ============================================================
 def get_api_key() -> str:
+    # 1) Streamlit secrets
     try:
-        k = st.secrets.get("POLYGON_API_KEY", "")
+        k = st.secrets.get("AlphaVantage_API_KEY", "")
         if k:
-            return k.strip()
+            return str(k).strip()
     except Exception:
         pass
-    return os.environ.get("POLYGON_API_KEY", "").strip()
+
+    # 2) Env var fallback
+    return os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
 
 
 API_KEY = get_api_key()
@@ -49,8 +54,7 @@ def utc_now_label():
 
 
 # ============================================================
-# Ticker normalization for Polygon
-# - Polygon commonly uses dot classes (BRK.B) vs dash (BRK-B)
+# Ticker normalization for Alpha Vantage
 # ============================================================
 SPECIAL_TICKER_MAP = {
     "BRK-A": "BRK.A",
@@ -58,7 +62,6 @@ SPECIAL_TICKER_MAP = {
     "BRKA": "BRK.A",
     "BRKB": "BRK.B",
 }
-
 
 def normalize_ticker(t: str) -> str:
     t = (t or "").strip().upper()
@@ -78,7 +81,6 @@ def load_universe(csv_path: str) -> list[str]:
         if c.strip().lower() in ("ticker", "symbol"):
             col = c
             break
-
     if col is None:
         col = df.columns[0]
 
@@ -95,77 +97,122 @@ def load_universe(csv_path: str) -> list[str]:
 
 
 # ============================================================
-# Polygon / Massive AGGS fetch
-# Endpoint:
-# https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+# Alpha Vantage rate limiting (global)
 # ============================================================
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_daily_closes_polygon(ticker: str, start_date: str, end_date: str) -> pd.Series:
-    """
-    Returns a Series indexed by date (UTC midnight) with closes.
-    Cached for 1 hour.
-    """
-    if not API_KEY:
-        raise RuntimeError("Missing POLYGON_API_KEY.")
+_min_interval = 60.0 / max(1, int(CALLS_PER_MINUTE))
+_rate_lock = threading.Lock()
+_last_call_ts = 0.0
 
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+def _rate_limit_wait():
+    global _last_call_ts
+    with _rate_lock:
+        now = time.time()
+        elapsed = now - _last_call_ts
+        wait = _min_interval - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts = time.time()
+
+
+# ============================================================
+# Alpha Vantage fetch
+# Function: TIME_SERIES_DAILY_ADJUSTED
+# Uses "5. adjusted close"
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)  # cache 12 hours
+def fetch_daily_adj_closes_av(ticker: str) -> pd.Series:
+    if not API_KEY:
+        raise RuntimeError("Missing AlphaVantage_API_KEY.")
+
+    _rate_limit_wait()
+
+    url = "https://www.alphavantage.co/query"
     params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": API_KEY,
+        "function": "TIME_SERIES_DAILY_ADJUSTED",
+        "symbol": ticker,
+        "outputsize": "full",
+        "apikey": API_KEY,
     }
 
-    s = requests.Session()
-    r = s.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     js = r.json()
 
-    results = js.get("results", [])
-    if not results:
+    # Common AV throttling / errors
+    if "Note" in js:
+        # Rate-limit note
+        raise RuntimeError(js["Note"])
+    if "Error Message" in js:
+        raise RuntimeError(js["Error Message"])
+
+    ts_key = "Time Series (Daily)"
+    if ts_key not in js:
+        # Sometimes returns different keys or an unexpected payload
+        raise RuntimeError(f"Unexpected Alpha Vantage response for {ticker}: {list(js.keys())[:5]}")
+
+    rows = js[ts_key]  # dict of date -> o/h/l/c/adj/vol/etc
+    if not rows:
         return pd.Series(dtype="float64", name=ticker)
 
-    df = pd.DataFrame(results)
-    # t is ms epoch
-    dt = pd.to_datetime(df["t"], unit="ms", utc=True).dt.normalize()
-    close = pd.Series(df["c"].values, index=dt, name=ticker).astype(float)
-    close = close[~close.index.duplicated(keep="last")]
-    return close
+    # Build series
+    # Date strings are YYYY-MM-DD
+    idx = []
+    vals = []
+    for d, rec in rows.items():
+        # adjusted close: "5. adjusted close"
+        v = rec.get("5. adjusted close")
+        if v is None:
+            continue
+        try:
+            idx.append(pd.to_datetime(d, utc=True).normalize())
+            vals.append(float(v))
+        except Exception:
+            continue
+
+    if not idx:
+        return pd.Series(dtype="float64", name=ticker)
+
+    s = pd.Series(vals, index=idx, name=ticker).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    return s
 
 
-def build_price_matrix(tickers: list[str], start_date: str, end_date: str, max_workers: int) -> pd.DataFrame:
+def build_price_matrix(tickers: list[str]) -> tuple[pd.DataFrame, int, list[str]]:
     """
-    Concurrent fetch -> DataFrame of closes.
+    Sequential fetch (recommended for Alpha Vantage free tier).
+    Returns: (DataFrame closes, failures_count, failed_tickers)
     """
     tickers = [normalize_ticker(t) for t in tickers]
     tickers = list(dict.fromkeys([t for t in tickers if t]))
 
-    # Use one session per thread inside cached function call; okay.
     out = {}
-    failures = 0
+    failed = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {
-            ex.submit(fetch_daily_closes_polygon, t, start_date, end_date): t
-            for t in tickers
-        }
+    prog = st.progress(0)
+    status = st.empty()
 
-        for fut in as_completed(futs):
-            t = futs[fut]
-            try:
-                ser = fut.result()
-                if ser is not None and not ser.empty:
-                    out[t] = ser
-            except Exception:
-                failures += 1
+    n = len(tickers)
+    for i, t in enumerate(tickers, start=1):
+        status.write(f"Downloading {t} ({i}/{n}) …")
+        try:
+            ser = fetch_daily_adj_closes_av(t)
+            if ser is not None and not ser.empty:
+                out[t] = ser
+            else:
+                failed.append(t)
+        except Exception:
+            failed.append(t)
+
+        prog.progress(i / n)
+
+    status.empty()
 
     if not out:
-        raise RuntimeError("No price data returned for any tickers.")
+        raise RuntimeError("No price data returned for any tickers (check API key / rate limits).")
 
     df = pd.DataFrame(out).sort_index()
-    # forward-fill gaps
     df = df.ffill()
-    return df, failures
+    return df, len(failed), failed
 
 
 def rs_ratio(close_t: pd.Series, close_b: pd.Series, periods: int) -> float:
@@ -186,7 +233,7 @@ def rs_ratio(close_t: pd.Series, close_b: pd.Series, periods: int) -> float:
 # UI
 # ============================================================
 st.title("Relative Strength Scanner")
-st.caption(f"As of: {utc_now_label()} • Benchmark: {BENCHMARK}")
+st.caption(f"As of: {utc_now_label()} • Benchmark: {BENCHMARK} • Data: Alpha Vantage (Adjusted Close)")
 
 with st.sidebar:
     st.subheader("Scanner Controls")
@@ -212,19 +259,19 @@ with st.sidebar:
 
     max_results = st.slider("Max Results to Display", 25, 500, 200, step=25)
 
-    # Concurrency (bigger = faster, but free plans rate-limit; keep sane defaults)
-    max_workers = st.slider("Speed (parallel downloads)", 5, 40, 18, step=1)
+    st.caption(f"Rate limit: ~{CALLS_PER_MINUTE} calls/min (adjust in code if your AV plan allows more)")
 
     run = st.button("Run Scan", use_container_width=True)
 
-# Guard: API key required
+
 if not API_KEY:
     st.error(
         "Missing API key.\n\n"
-        "Set POLYGON_API_KEY in Streamlit Secrets or as an environment variable. "
-        "Users will not be prompted for it when you do that."
+        "Set **AlphaVantage_API_KEY** in Streamlit Secrets (recommended) "
+        "or set environment variable **ALPHAVANTAGE_API_KEY**."
     )
     st.stop()
+
 
 # Load tickers
 try:
@@ -237,37 +284,36 @@ if not universe:
     st.error(f"{CSV_FILE} loaded, but no tickers were found.")
     st.stop()
 
-# Ensure benchmark in pull list
+# Ensure benchmark included
 bench_norm = normalize_ticker(BENCHMARK)
 if bench_norm not in universe:
     universe = universe + [bench_norm]
 
 st.write(f"Universe size: **{len(universe):,}** tickers (including benchmark).")
 
+
 if run:
-    # Date range for Polygon
-    end_dt = datetime.now(timezone.utc).date()
-    start_dt = end_dt - timedelta(days=LOOKBACK_CAL_DAYS)
+    st.info("Pulling price data… (Alpha Vantage rate-limited; cached 12 hours per ticker)")
 
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str = end_dt.strftime("%Y-%m-%d")
-
-    st.info("Pulling price data… (cached for 1 hour)")
-    prog = st.progress(0)
-
-    # Fetch data
-    price_df, failures = build_price_matrix(universe, start_str, end_str, max_workers=max_workers)
-    prog.progress(1.0)
+    try:
+        price_df, failures, failed_list = build_price_matrix(universe)
+    except Exception as e:
+        st.error(f"Download failed: {e}")
+        st.stop()
 
     if bench_norm not in price_df.columns:
         st.error(
             f"Benchmark {BENCHMARK} returned no data.\n\n"
-            "This usually means either:\n"
-            "- rate limiting on your plan\n"
-            "- temporary API issue\n"
-            "- benchmark symbol mismatch\n"
+            "This usually means:\n"
+            "- Alpha Vantage rate limit hit\n"
+            "- Symbol mismatch\n"
+            "- Temporary API issue\n"
         )
         st.stop()
+
+    # Keep only last ~300 trading days if you want speed in RS calc
+    # (Optional) Uncomment:
+    # price_df = price_df.tail(320)
 
     bench = price_df[bench_norm]
 
@@ -284,7 +330,7 @@ if run:
 
     df = pd.DataFrame(rows)
 
-    # Convert each RS column to 1–99 percentile across entire universe
+    # Convert each RS column to 1–99 percentile across universe
     for col in HORIZONS.keys():
         s = pd.to_numeric(df[col], errors="coerce")
         df[col] = (s.rank(pct=True) * 99).round().clip(1, 99)
@@ -309,13 +355,17 @@ if run:
     df_f = df_f.sort_values([primary_tf, "RS 1Y"], ascending=[False, False])
 
     st.success(
-        f"Scan complete • {len(df_f):,} matches "
-        f"(failed tickers during fetch: {failures})"
+        f"Scan complete • {len(df_f):,} matches • "
+        f"failed tickers during fetch: {failures}"
     )
 
-    # Limit displayed results (still ranked against full universe)
-    df_show = df_f.head(max_results).reset_index(drop=True)
+    if failures and failed_list:
+        with st.expander("Failed tickers (click to view)"):
+            st.write(", ".join(failed_list[:500]))
+            if len(failed_list) > 500:
+                st.write(f"...and {len(failed_list) - 500} more")
 
+    df_show = df_f.head(max_results).reset_index(drop=True)
     st.dataframe(df_show, use_container_width=True, height=700)
 
     st.markdown(
@@ -323,15 +373,14 @@ if run:
 **How ranking works**  
 - Each stock is compared to **SPY** over each timeframe (1W/1M/3M/6M/1Y).  
 - Those relative-performance values are percentile-ranked **across your entire CSV universe** into **RS 1–99**.  
-- So RS 99 means “top ~1% of your list” for that timeframe.
+- RS 99 means “top ~1% of your list” for that timeframe.
 """
     )
 
     with st.expander("Troubleshooting"):
         st.write(
-            "- If scans are slow or you see missing data on the free plan, reduce **Speed (parallel downloads)**.\n"
-            "- Free tiers often rate-limit bulk calls; paid tiers are dramatically faster and more consistent.\n"
-            "- If class-share tickers fail (BRK-B), try ensuring the CSV uses BRK-B or BRK.B; the app normalizes these."
+            "- If you see a message starting with **'Thank you for using Alpha Vantage…'**, you hit the rate limit.\n"
+            "- On the free plan, keep CALLS_PER_MINUTE at 5 and expect larger universes to take time.\n"
+            "- If you have a higher-tier Alpha Vantage plan, increase CALLS_PER_MINUTE in the code.\n"
+            "- If some symbols fail, verify they are valid Alpha Vantage symbols (class shares often use dot format like BRK.B)."
         )
-
-
