@@ -1,8 +1,5 @@
-# requirements.txt
 streamlit
-yfinance
 pandas
 numpy
-lxml
-beautifulsoup4
 requests
+
