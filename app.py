@@ -1,333 +1,403 @@
-from __future__ import annotations
-
 import os
-import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
 
-# =========================
-# Page
-# =========================
-st.set_page_config(page_title="Relative Strength Scanner", layout="wide")
+# ============================================================
+# CONFIG
+# ============================================================
+st.set_page_config(page_title="Relative Strength Scanner (yfinance)", layout="wide")
+
+CSV_FILE = "Tickers.csv"
+BENCHMARK = "SPY"
+
+# Pull enough history for RS 1Y (252 trading days) + buffer
+PRICE_PERIOD = "2y"
+INTERVAL = "1d"
+
+# RS horizons (trading days)
+HORIZONS = {
+    "RS 1W": 5,
+    "RS 1M": 21,
+    "RS 3M": 63,
+    "RS 6M": 126,
+    "RS 1Y": 252,
+}
+
+# Cache files (Streamlit Cloud file system persists between reruns; may reset on redeploy)
+CACHE_PARQUET = "yf_prices_cache.parquet"
+CACHE_META_TXT = "yf_cache_meta.txt"
 
 
-def _asof_ts() -> str:
+# ============================================================
+# HELPERS
+# ============================================================
+def utc_now_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-# =========================
-# Styling (keep it clean + readable)
-# =========================
-CSS = """
-<style>
-.block-container {max-width: 1750px; padding-top: 1.0rem; padding-bottom: 2rem;}
-.small-muted {opacity: 0.75; font-size: 0.9rem;}
-.hr {border-top: 1px solid rgba(255,255,255,0.12); margin: 14px 0;}
-.card {
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(255,255,255,0.03);
-  border-radius: 12px;
-  padding: 12px 14px;
-  margin-bottom: 12px;
+SPECIAL_TICKER_MAP = {
+    "BRK-A": "BRK.BRK-A",  # (we override below; keep map simple)
 }
-.card h3{margin:0 0 6px 0; font-size: 1.05rem; font-weight: 950;}
-.pill{
-  display:inline-block;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-weight: 950;
-  font-size: 0.82rem;
-  border: 1px solid rgba(255,255,255,0.12);
-}
-.pill-red{background: rgba(255,80,80,0.16); color:#FF6B6B;}
-.pill-amber{background: rgba(255,200,60,0.16); color: rgba(255,200,60,0.98);}
-.pill-green{background: rgba(80,255,120,0.16); color:#7CFC9A;}
 
-.pl-table-wrap {border-radius: 10px; overflow: hidden; border: 1px solid rgba(255,255,255,0.10);}
-table.pl-table {border-collapse: collapse; width: 100%; font-size: 13px;}
-table.pl-table thead th {
-  position: sticky; top: 0;
-  background: rgba(255,255,255,0.06);
-  color: rgba(255,255,255,0.92);
-  text-align: left;
-  padding: 8px 10px;
-  border-bottom: 1px solid rgba(255,255,255,0.12);
-  font-weight: 900;
-}
-table.pl-table tbody td{
-  padding: 7px 10px;
-  border-bottom: 1px solid rgba(255,255,255,0.08);
-  vertical-align: middle;
-}
-td.ticker {font-weight: 950;}
-td.mono {font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
-
-# =========================
-# Config
-# =========================
-DEFAULT_TICKERS_FILE = "tickers.csv"
-DEFAULT_BENCHMARK = "SPY"
-
-# Trading-day approximations (same as your RS dashboard logic)
-HORIZONS = {
-    "1W": 5,
-    "1M": 21,
-    "3M": 63,
-    "6M": 126,
-    "1Y": 252,
+# Better: explicit mappings for class shares
+SPECIAL_TICKER_MAP = {
+    "BRK-A": "BRK.A",
+    "BRK-B": "BRK.B",
+    "BRKA": "BRK.A",
+    "BRKB": "BRK.B",
 }
 
 
-# =========================
-# Helpers
-# =========================
-def _clean_symbol(x: str) -> str:
-    x = str(x).strip().upper()
-    if not x:
-        return ""
-    # a couple common cleanup patterns
-    x = x.replace("\u200b", "")  # zero-width spaces
-    return x
+def normalize_ticker(t: str) -> str:
+    t = (t or "").strip().upper()
+    t = t.replace(" ", "")
+    t = t.replace("/", "-")
+    t = SPECIAL_TICKER_MAP.get(t, t)
+    return t
 
 
-def load_tickers_from_csv_path(path: str) -> list[str]:
-    df = pd.read_csv(path)
+def load_universe(csv_path: str) -> List[str]:
+    df = pd.read_csv(csv_path)
     if df.empty:
         return []
-    # Take the first non-empty column
-    col = df.columns[0]
-    tickers = [_clean_symbol(v) for v in df[col].tolist()]
-    tickers = [t for t in tickers if t and t != "SYMBOL" and t != "TICKER"]
-    # De-dupe, keep order
-    seen = set()
-    out = []
-    for t in tickers:
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
+
+    col = None
+    for c in df.columns:
+        if c.strip().lower() in ("ticker", "symbol"):
+            col = c
+            break
+    if col is None:
+        col = df.columns[0]
+
+    ticks = (
+        df[col]
+        .astype(str)
+        .map(normalize_ticker)
+        .replace({"NAN": "", "NONE": ""})
+        .tolist()
+    )
+    ticks = [t for t in ticks if t and t.isascii()]
+    ticks = list(dict.fromkeys(ticks))  # unique preserve order
+    return ticks
 
 
-def load_tickers_from_uploaded(file) -> list[str]:
-    df = pd.read_csv(file)
-    if df.empty:
-        return []
-    col = df.columns[0]
-    tickers = [_clean_symbol(v) for v in df[col].tolist()]
-    tickers = [t for t in tickers if t and t != "SYMBOL" and t != "TICKER"]
-    seen = set()
-    out = []
-    for t in tickers:
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
+def chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-def pct_change(close: pd.Series, periods: int) -> pd.Series:
-    return close.pct_change(periods=periods)
+def save_cache(df_prices: pd.DataFrame) -> None:
+    df_prices.to_parquet(CACHE_PARQUET, index=True)
+    with open(CACHE_META_TXT, "w") as f:
+        f.write(f"Saved: {utc_now_label()} | rows={len(df_prices):,} cols={len(df_prices.columns):,}\n")
 
 
-def rs_ratio_return(close_t: pd.Series, close_b: pd.Series, periods: int) -> pd.Series:
+def load_cache() -> Tuple[pd.DataFrame, str]:
+    if not os.path.exists(CACHE_PARQUET):
+        return pd.DataFrame(), "No cache file found."
+    try:
+        df = pd.read_parquet(CACHE_PARQUET)
+        meta = ""
+        if os.path.exists(CACHE_META_TXT):
+            with open(CACHE_META_TXT, "r") as f:
+                meta = f.read().strip()
+        return df, (meta or "Loaded cache.")
+    except Exception as e:
+        return pd.DataFrame(), f"Failed to load cache: {e}"
+
+
+def _extract_close_matrix(raw: pd.DataFrame, tickers_in_batch: List[str]) -> pd.DataFrame:
     """
-    RS over a window = % change of (ticker / benchmark) over that window.
-    Equivalent to: ( (t / t[-n]) / (b / b[-n]) ) - 1
+    yfinance download output:
+      - single ticker: columns like Open/High/Low/Close/Volume
+      - multi ticker: MultiIndex columns; either (PriceField, Ticker) or (Ticker, PriceField)
+    We return Close matrix with columns = tickers.
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # Single ticker case
+    if isinstance(raw.columns, pd.Index) and "Close" in raw.columns:
+        t = normalize_ticker(tickers_in_batch[0])
+        out = raw[["Close"]].rename(columns={"Close": t})
+        return out
+
+    # MultiIndex case
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = set(raw.columns.get_level_values(0))
+        lvl1 = set(raw.columns.get_level_values(1))
+
+        if "Close" in lvl0:
+            # (Field, Ticker)
+            close = raw["Close"].copy()
+            close.columns = [normalize_ticker(c) for c in close.columns]
+            return close
+
+        if "Close" in lvl1:
+            # (Ticker, Field)
+            close = raw.xs("Close", axis=1, level=1).copy()
+            close.columns = [normalize_ticker(c) for c in close.columns]
+            return close
+
+    return pd.DataFrame()
+
+
+def rs_ratio(close_t: pd.Series, close_b: pd.Series, periods: int) -> float:
+    """
+    ( (t/t_shift) / (b/b_shift) ) - 1
     """
     t = close_t / close_t.shift(periods)
     b = close_b / close_b.shift(periods)
-    return (t / b) - 1
+    rr = (t / b) - 1
+    rr = rr.dropna()
+    if rr.empty:
+        return np.nan
+    return float(rr.iloc[-1])
 
 
-def rs_rank_1_99(values: pd.Series) -> pd.Series:
-    s = pd.to_numeric(values, errors="coerce")
-    # rank percent -> 1..99
-    return (s.rank(pct=True) * 99).round().clip(1, 99)
-
-
-def render_table_html(df: pd.DataFrame, height_px: int = 800):
-    columns = list(df.columns)
-
-    th = "".join([f"<th>{c}</th>" for c in columns])
-    trs = []
-    for _, row in df.iterrows():
-        tds = []
-        for c in columns:
-            v = row.get(c, "")
-            cls = ""
-            if c == "Ticker":
-                cls = "ticker"
-            if c in ["RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y", "Accel", "Decel"]:
-                cls = "mono"
-            tds.append(f'<td class="{cls}">{"" if pd.isna(v) else v}</td>')
-        trs.append("<tr>" + "".join(tds) + "</tr>")
-
-    table = f"""
-    <div class="pl-table-wrap" style="max-height:{height_px}px; overflow:auto;">
-      <table class="pl-table">
-        <thead><tr>{th}</tr></thead>
-        <tbody>
-          {''.join(trs)}
-        </tbody>
-      </table>
-    </div>
-    """
-    st.markdown(table, unsafe_allow_html=True)
-
-
-# =========================
-# Price fetching (chunked)
-# =========================
-@dataclass
-class FetchResult:
-    close: pd.DataFrame  # columns=tickers, index=date
-    missing: list[str]
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_closes_chunked(
-    tickers: list[str],
+# ============================================================
+# DATA DOWNLOAD (MANUAL) — uses refresh_id to bust cache
+# ============================================================
+@st.cache_data(show_spinner=False)
+def fetch_prices_yf_chunked(
+    tickers: Tuple[str, ...],
+    batch_size: int,
+    refresh_id: int,
     period: str,
-    chunk_size: int,
-    pause_s: float,
-) -> FetchResult:
+    interval: str,
+) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Pull adjusted daily closes for a large universe in chunks using yfinance.
-
-    Notes:
-    - yfinance can be flaky. Chunking + small pause helps.
-    - This returns a wide close dataframe with columns for each ticker found.
+    Returns (close_matrix_df, failed_tickers)
+    refresh_id ensures this runs only when user clicks Refresh.
     """
-    all_close_parts = []
-    missing = []
+    ticks = [normalize_ticker(t) for t in tickers]
+    ticks = list(dict.fromkeys([t for t in ticks if t]))
 
-    # yfinance sometimes fails on bad symbols; we keep going
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i : i + chunk_size]
+    failed: List[str] = []
+    closes: List[pd.DataFrame] = []
+
+    # yfinance can be sensitive; smaller batches are more reliable for huge universes
+    for batch in chunk_list(ticks, batch_size):
         try:
-            df = yf.download(
-                tickers=chunk,
+            raw = yf.download(
+                tickers=" ".join(batch),
                 period=period,
-                interval="1d",
+                interval=interval,
+                group_by="column",
                 auto_adjust=True,
-                group_by="ticker",
                 threads=True,
                 progress=False,
             )
+            close = _extract_close_matrix(raw, batch)
+            if close is None or close.empty:
+                failed.extend(batch)
+            else:
+                closes.append(close)
         except Exception:
-            df = pd.DataFrame()
+            failed.extend(batch)
 
-        if df is None or df.empty:
-            # mark all missing for this chunk
-            missing.extend(chunk)
-            time.sleep(pause_s)
-            continue
+    if not closes:
+        return pd.DataFrame(), failed
 
-        # MultiIndex columns if multiple tickers
-        if isinstance(df.columns, pd.MultiIndex):
-            closes = {}
-            for t in chunk:
-                if (t, "Close") in df.columns:
-                    closes[t] = df[(t, "Close")]
-            close_df = pd.DataFrame(closes)
-        else:
-            # single ticker
-            close_df = pd.DataFrame({chunk[0]: df["Close"]})
+    df = pd.concat(closes, axis=1)
 
-        # Track missing inside chunk
-        found = set(close_df.columns.tolist())
-        for t in chunk:
-            if t not in found:
-                missing.append(t)
+    # Normalize index
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert("UTC").normalize()
+    df = df.sort_index()
 
-        all_close_parts.append(close_df)
-        time.sleep(pause_s)
+    # De-dupe columns
+    df = df.loc[:, ~df.columns.duplicated(keep="last")]
 
-    if not all_close_parts:
-        return FetchResult(close=pd.DataFrame(), missing=sorted(list(set(missing))))
+    # Forward-fill gaps
+    df = df.ffill()
 
-    close_all = pd.concat(all_close_parts, axis=1)
-    close_all = close_all.dropna(how="all").ffill()
-    # De-dupe columns if any repeats
-    close_all = close_all.loc[:, ~close_all.columns.duplicated()]
+    # Reduce memory footprint (6600 cols can be heavy)
+    df = df.astype("float32")
 
-    return FetchResult(close=close_all, missing=sorted(list(set(missing))))
+    return df, failed
 
 
-# =========================
+# ============================================================
 # UI
-# =========================
-st.title("Relative Strength Scanner")
-st.caption(f"As of: {_asof_ts()} • Benchmark: {DEFAULT_BENCHMARK}")
+# ============================================================
+st.title("Relative Strength Scanner (yfinance • Manual Refresh)")
+st.caption(f"As of: {utc_now_label()} • Benchmark: {BENCHMARK}")
 
-with st.sidebar:
-    st.subheader("Universe")
-    use_repo_csv = st.checkbox(f"Use repo file: {DEFAULT_TICKERS_FILE}", value=True)
-
-    uploaded = None
-    if not use_repo_csv:
-        uploaded = st.file_uploader("Upload tickers CSV", type=["csv"])
-
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-    st.subheader("Scan Settings")
-    benchmark = st.text_input("Benchmark", value=DEFAULT_BENCHMARK).strip().upper() or DEFAULT_BENCHMARK
-    period = st.selectbox(
-        "History pulled (more history = slower)",
-        options=["18mo", "2y", "3y"],
-        index=1,
-    )
-
-    chunk_size = st.slider("Batch size", min_value=50, max_value=400, value=200, step=25)
-    pause_s = st.slider("Pause between batches (seconds)", min_value=0.0, max_value=2.0, value=0.25, step=0.05)
-
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-    st.subheader("Filters")
-    mode = st.selectbox(
-        "Scan mode",
-        options=[
-            "RS threshold (single timeframe)",
-            "RS threshold (all selected timeframes)",
-            "Accelerating leaders (improving RS)",
-            "Decelerating leaders (weakening RS)",
-        ],
-        index=0,
-    )
-
-    tf_sort = st.selectbox("Sort timeframe", options=list(HORIZONS.keys()), index=1)  # default 1M
-    min_rs = st.slider("Minimum RS (1–99)", min_value=1, max_value=99, value=90, step=1)
-    max_rows = st.slider("Max results to show", min_value=50, max_value=1000, value=250, step=50)
-
-    tfs = st.multiselect(
-        "Timeframes used for filter (where applicable)",
-        options=list(HORIZONS.keys()),
-        default=["1W", "1M", "3M", "6M", "1Y"],
-    )
-
-    run = st.button("Run Scan", type="primary", use_container_width=True)
+# session state
+if "refresh_id" not in st.session_state:
+    st.session_state.refresh_id = 0
 
 # Load tickers
-tickers: list[str] = []
-tickers_source = ""
+try:
+    universe = load_universe(CSV_FILE)
+except Exception as e:
+    st.error(f"Could not load {CSV_FILE}: {e}")
+    st.stop()
 
-if use_repo_csv:
-    if os.path.exists(DEFAULT_TICKERS_FILE):
-        tickers = load_tickers_from_csv_path(DEFAULT_TICKERS_FILE)
-        tickers_source = f"Loaded from repo file: {DEFAULT_TICKERS_FILE}"
+if not universe:
+    st.error(f"{CSV_FILE} loaded, but no tickers were found.")
+    st.stop()
+
+bench_norm = normalize_ticker(BENCHMARK)
+if bench_norm not in universe:
+    universe = universe + [bench_norm]
+
+st.write(f"Universe size: **{len(universe):,}** tickers (including benchmark).")
+
+with st.sidebar:
+    st.subheader("Data Controls")
+
+    batch_size = st.slider(
+        "Batch size (tickers per request)",
+        min_value=100,
+        max_value=800,
+        value=300,
+        step=50
+    )
+
+    period = st.selectbox("History window", ["1y", "2y", "5y"], index=1)
+    interval = st.selectbox("Interval", ["1d"], index=0)
+
+    refresh_btn = st.button("Refresh data now", use_container_width=True)
+
+    st.caption("If refresh fails: lower batch size (250–350) and try again.")
+
+    st.divider()
+    st.subheader("Scanner Controls")
+
+    rs_min = st.slider("Minimum RS Rating", 1, 99, 90, 1)
+
+    primary_tf = st.selectbox(
+        "Primary Timeframe",
+        list(HORIZONS.keys()),
+        index=1
+    )
+
+    mode = st.selectbox(
+        "Scan Mode",
+        [
+            "Primary timeframe only",
+            "All timeframes >= threshold",
+            "Accelerating (RS 1Y → RS 1W improving)",
+            "Decelerating (RS 1W → RS 1Y weakening)",
+        ],
+        index=0
+    )
+
+    max_results = st.slider("Max Results to Display", 25, 500, 200, step=25)
+
+
+# Always try to load disk cache first so app never goes blank
+cache_df, cache_meta = load_cache()
+if not cache_df.empty:
+    st.info(f"Loaded last saved cache. {cache_meta}")
+
+# Manual refresh
+failed_total: List[str] = []
+if refresh_btn:
+    st.session_state.refresh_id += 1
+    st.warning("Refreshing prices from Yahoo Finance… (large universes can take time)")
+    df_new, failed_total = fetch_prices_yf_chunked(
+        tickers=tuple(universe),
+        batch_size=batch_size,
+        refresh_id=st.session_state.refresh_id,
+        period=period,
+        interval=interval,
+    )
+    if df_new.empty:
+        st.error("Yahoo returned empty data. Lower batch size and try again (e.g., 250–300).")
+        if cache_df.empty:
+            st.stop()
+        st.warning("Using last saved cache instead.")
     else:
-        tickers_source = f"Could not find {DEFAULT_TICKERS_FILE}
+        save_cache(df_new)
+        cache_df = df_new
+        st.success(f"Refresh complete. Cached {len(cache_df.columns):,} tickers.")
+
+# Use cache_df
+price_df = cache_df.copy()
+if price_df.empty:
+    st.error("No cache yet. Click **Refresh data now**.")
+    st.stop()
+
+# Ensure benchmark exists
+if bench_norm not in price_df.columns:
+    st.error(f"Benchmark {BENCHMARK} missing from data. Try refresh again.")
+    st.stop()
+
+# Ensure enough history for 1Y
+min_len_needed = max(HORIZONS.values()) + 5
+usable_cols = [c for c in price_df.columns if price_df[c].dropna().shape[0] >= min_len_needed]
+if bench_norm not in usable_cols:
+    st.error(f"Benchmark {BENCHMARK} doesn’t have enough history yet. Try refresh again.")
+    st.stop()
+
+price_df = price_df[usable_cols].copy()
+bench = price_df[bench_norm]
+
+st.write(f"Tickers with sufficient history (including benchmark): **{len(price_df.columns):,}**")
+
+if failed_total:
+    with st.expander("Download issues (some tickers may be missing)"):
+        st.write(f"Failed tickers count: {len(failed_total):,}")
+        st.write(", ".join(failed_total[:500]) + (" ..." if len(failed_total) > 500 else ""))
+
+# Compute RS
+tickers_to_score = [t for t in price_df.columns if t != bench_norm]
+
+rows = []
+for t in tickers_to_score:
+    close = price_df[t]
+    rec = {"Ticker": t}
+    for col, n in HORIZONS.items():
+        rec[col] = rs_ratio(close, bench, n)
+    rows.append(rec)
+
+df = pd.DataFrame(rows)
+
+# Percentile rank -> 1..99
+for col in HORIZONS.keys():
+    s = pd.to_numeric(df[col], errors="coerce")
+    df[col] = (s.rank(pct=True) * 99).round().clip(1, 99)
+
+# Filter
+if mode == "Primary timeframe only":
+    df_f = df[df[primary_tf] >= rs_min].copy()
+elif mode == "All timeframes >= threshold":
+    cond = True
+    for col in HORIZONS.keys():
+        cond = cond & (df[col] >= rs_min)
+    df_f = df[cond].copy()
+elif mode == "Accelerating (RS 1Y → RS 1W improving)":
+    df_f = df[(df["RS 1W"] > df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
+else:
+    df_f = df[(df["RS 1W"] < df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
+
+df_f = df_f.sort_values([primary_tf, "RS 1Y"], ascending=[False, False])
+
+st.success(f"Scan complete • {len(df_f):,} matches")
+st.dataframe(df_f.head(max_results).reset_index(drop=True), use_container_width=True, height=720)
+
+st.markdown(
+    """
+**How ranking works**  
+- Each stock is compared to **SPY** over each timeframe (1W/1M/3M/6M/1Y).  
+- Those relative-performance values are percentile-ranked across your universe into **RS 1–99**.  
+"""
+)
+
+with st.expander("If refresh is slow / fails"):
+    st.write(
+        "- Lower **batch size** to 250–300.\n"
+        "- Use **2y** history for reliable 1Y RS.\n"
+        "- Yahoo throttles sometimes; this app keeps your last saved cache so you can still scan.\n"
+    )
+
 
 
