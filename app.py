@@ -1,32 +1,24 @@
 import os
-import time
-import json
-import threading
 from datetime import datetime, timezone
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
+import yfinance as yf
 
 
 # ============================================================
 # CONFIG
 # ============================================================
-st.set_page_config(page_title="Relative Strength Scanner (Alpha Vantage Cache)", layout="wide")
+st.set_page_config(page_title="Relative Strength Scanner (yfinance)", layout="wide")
 
 CSV_FILE = "Tickers.csv"
 BENCHMARK = "SPY"
 
-# Alpha Vantage rate limit (free is usually 5/min). If you have a paid plan, raise it.
-CALLS_PER_MINUTE = 5
-
-# How many trading days we keep per ticker (enough for RS 1Y=252 plus buffer)
-KEEP_TRADING_DAYS = 320
-
-# Cache files (Streamlit Cloud: ephemeral but persists across runs until redeploy / sleep)
-CACHE_PARQUET = "av_prices_cache.parquet"     # long format: date, ticker, close
-META_JSON = "av_cache_meta.json"              # { "TICKER": {"updated_utc": "..."} }
+# How far back to pull prices (2y is plenty for RS 1Y=252 trading days)
+PRICE_PERIOD = "2y"
+INTERVAL = "1d"
 
 # RS horizons (trading days)
 HORIZONS = {
@@ -37,30 +29,18 @@ HORIZONS = {
     "RS 1Y": 252,
 }
 
+# Local cache (persists on Streamlit Cloud disk between runs until redeploy/sleep)
+CACHE_PARQUET = "yf_prices_cache.parquet"
+CACHE_META = "yf_cache_meta.txt"
+
 
 # ============================================================
-# API KEY
+# HELPERS
 # ============================================================
-def get_api_key() -> str:
-    try:
-        k = st.secrets.get("AlphaVantage_API_KEY", "")
-        if k:
-            return str(k).strip()
-    except Exception:
-        pass
-    return os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
-
-
-API_KEY = get_api_key()
-
-
 def utc_now_label():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-# ============================================================
-# Ticker normalization for Alpha Vantage
-# ============================================================
 SPECIAL_TICKER_MAP = {
     "BRK-A": "BRK.A",
     "BRK-B": "BRK.B",
@@ -76,7 +56,7 @@ def normalize_ticker(t: str) -> str:
     return t
 
 
-def load_universe(csv_path: str) -> list[str]:
+def load_universe(csv_path: str) -> List[str]:
     df = pd.read_csv(csv_path)
     if df.empty:
         return []
@@ -101,150 +81,80 @@ def load_universe(csv_path: str) -> list[str]:
     return ticks
 
 
-# ============================================================
-# Rate limiting (global)
-# ============================================================
-_min_interval = 60.0 / max(1, int(CALLS_PER_MINUTE))
-_rate_lock = threading.Lock()
-_last_call_ts = 0.0
-
-def _rate_limit_wait():
-    global _last_call_ts
-    with _rate_lock:
-        now = time.time()
-        elapsed = now - _last_call_ts
-        wait = _min_interval - elapsed
-        if wait > 0:
-            time.sleep(wait)
-        _last_call_ts = time.time()
+def chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-# ============================================================
-# Alpha Vantage fetch (Daily Adjusted)
-# ============================================================
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)  # cache each ticker response 12h
-def fetch_daily_adj_closes_av(ticker: str) -> pd.Series:
-    """
-    Returns a Series indexed by UTC-normalized date with adjusted close.
-    Keeps full output from AV, but we later trim to KEEP_TRADING_DAYS.
-    """
-    if not API_KEY:
-        raise RuntimeError("Missing AlphaVantage_API_KEY.")
-
-    _rate_limit_wait()
-
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "TIME_SERIES_DAILY_ADJUSTED",
-        "symbol": ticker,
-        "outputsize": "full",
-        "apikey": API_KEY,
-    }
-
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-
-    if "Note" in js:
-        # Rate-limit response
-        raise RuntimeError(js["Note"])
-    if "Error Message" in js:
-        raise RuntimeError(js["Error Message"])
-
-    ts_key = "Time Series (Daily)"
-    if ts_key not in js:
-        raise RuntimeError(f"Unexpected Alpha Vantage response keys for {ticker}: {list(js.keys())[:6]}")
-
-    rows = js[ts_key]
-    if not rows:
-        return pd.Series(dtype="float64", name=ticker)
-
-    idx, vals = [], []
-    for d, rec in rows.items():
-        v = rec.get("5. adjusted close")
-        if v is None:
-            continue
-        try:
-            idx.append(pd.to_datetime(d, utc=True).normalize())
-            vals.append(float(v))
-        except Exception:
-            continue
-
-    if not idx:
-        return pd.Series(dtype="float64", name=ticker)
-
-    s = pd.Series(vals, index=idx, name=ticker).sort_index()
-    s = s[~s.index.duplicated(keep="last")]
-    return s
+def save_cache(df_prices: pd.DataFrame) -> None:
+    df_prices.to_parquet(CACHE_PARQUET)
+    with open(CACHE_META, "w") as f:
+        f.write(f"Saved: {utc_now_label()} | rows={len(df_prices)} cols={len(df_prices.columns)}\n")
 
 
-# ============================================================
-# Disk cache (prices + metadata)
-# ============================================================
-def load_meta() -> dict:
-    if not os.path.exists(META_JSON):
-        return {}
-    try:
-        with open(META_JSON, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_meta(meta: dict) -> None:
-    with open(META_JSON, "w") as f:
-        json.dump(meta, f)
-
-def load_price_cache_long() -> pd.DataFrame:
-    """
-    Long format: date, ticker, close
-    """
+def load_cache() -> Tuple[pd.DataFrame, str]:
     if not os.path.exists(CACHE_PARQUET):
-        return pd.DataFrame(columns=["date", "ticker", "close"])
+        return pd.DataFrame(), "No local cache found."
     try:
         df = pd.read_parquet(CACHE_PARQUET)
-        if df.empty:
-            return pd.DataFrame(columns=["date", "ticker", "close"])
-        df["date"] = pd.to_datetime(df["date"], utc=True).dt.normalize()
-        return df[["date", "ticker", "close"]]
-    except Exception:
-        return pd.DataFrame(columns=["date", "ticker", "close"])
+        meta = ""
+        if os.path.exists(CACHE_META):
+            with open(CACHE_META, "r") as f:
+                meta = f.read().strip()
+        return df, (meta or "Loaded local cache.")
+    except Exception as e:
+        return pd.DataFrame(), f"Failed to load cache: {e}"
 
-def save_price_cache_long(df_long: pd.DataFrame) -> None:
-    # Keep it compact and consistent
-    df_long = df_long.copy()
-    df_long["date"] = pd.to_datetime(df_long["date"], utc=True).dt.normalize()
-    df_long["ticker"] = df_long["ticker"].astype(str)
-    df_long["close"] = pd.to_numeric(df_long["close"], errors="coerce")
-    df_long = df_long.dropna(subset=["date", "ticker", "close"])
-    df_long.to_parquet(CACHE_PARQUET, index=False)
 
-def upsert_ticker_into_cache(df_long: pd.DataFrame, ticker: str, ser: pd.Series) -> pd.DataFrame:
+def _extract_close_matrix(raw: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     """
-    Replace existing ticker rows with new trimmed data.
+    yfinance download returns different shapes depending on count:
+    - MultiIndex columns (field, ticker) or (ticker, field)
+    - or single-index columns for 1 ticker
+    We return a DataFrame with columns=tickers and values=Close (auto_adjusted).
     """
-    ticker = normalize_ticker(ticker)
-    ser = ser.dropna().sort_index()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
 
-    # Trim to last KEEP_TRADING_DAYS trading rows
-    ser = ser.tail(KEEP_TRADING_DAYS)
+    # If 1 ticker, columns like: Open High Low Close Volume
+    if isinstance(raw.columns, pd.Index) and "Close" in raw.columns:
+        # single ticker case -> name it
+        t = tickers[0]
+        out = raw[["Close"]].rename(columns={"Close": t})
+        return out
 
-    new_rows = pd.DataFrame({
-        "date": ser.index,
-        "ticker": ticker,
-        "close": ser.values.astype(float),
-    })
+    # MultiIndex case
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Could be (PriceField, Ticker) or (Ticker, PriceField)
+        lvl0 = set(raw.columns.get_level_values(0))
+        lvl1 = set(raw.columns.get_level_values(1))
 
-    if df_long.empty:
-        return new_rows
+        if "Close" in lvl0:
+            # (Field, Ticker)
+            close = raw["Close"]
+            # close columns are tickers
+            return close
 
-    df_long = df_long[df_long["ticker"] != ticker]
-    return pd.concat([df_long, new_rows], ignore_index=True)
+        if "Close" in lvl1:
+            # (Ticker, Field)
+            close = raw.xs("Close", axis=1, level=1)
+            return close
+
+    # Fallback: try common patterns
+    for col in ["Adj Close", "Close"]:
+        try:
+            if col in raw.columns:
+                return raw[[col]].rename(columns={col: tickers[0]})
+        except Exception:
+            pass
+
+    return pd.DataFrame()
 
 
-# ============================================================
-# RS math
-# ============================================================
 def rs_ratio(close_t: pd.Series, close_b: pd.Series, periods: int) -> float:
+    """
+    Relative performance ratio of ticker vs benchmark over 'periods' trading days.
+    Returns last value of ( (t/t_shift) / (b/b_shift) ) - 1
+    """
     t = close_t / close_t.shift(periods)
     b = close_b / close_b.shift(periods)
     rr = (t / b) - 1
@@ -254,31 +164,67 @@ def rs_ratio(close_t: pd.Series, close_b: pd.Series, periods: int) -> float:
     return float(rr.iloc[-1])
 
 
-def build_price_matrix_from_cache(df_long: pd.DataFrame) -> pd.DataFrame:
+# ============================================================
+# DATA PULL (MANUAL REFRESH) — cached by refresh_id
+# ============================================================
+@st.cache_data(show_spinner=False)
+def fetch_prices_yf_chunked(
+    tickers: Tuple[str, ...],
+    batch_size: int,
+    refresh_id: int,
+    period: str = PRICE_PERIOD,
+    interval: str = INTERVAL
+) -> pd.DataFrame:
     """
-    Pivot cache to wide date-index DataFrame, ffill missing.
+    refresh_id is included to bust cache only when user clicks Refresh.
     """
-    if df_long.empty:
+    ticks = list(tickers)
+    batches = chunk_list(ticks, batch_size)
+
+    all_close = []
+    for batch in batches:
+        # yf.download handles multiple tickers efficiently
+        raw = yf.download(
+            tickers=" ".join(batch),
+            period=period,
+            interval=interval,
+            group_by="column",
+            auto_adjust=True,
+            threads=True,
+            progress=False,
+        )
+        close = _extract_close_matrix(raw, batch)
+        if close is not None and not close.empty:
+            all_close.append(close)
+
+    if not all_close:
         return pd.DataFrame()
 
-    dfp = df_long.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
-    dfp = dfp.ffill()
-    return dfp
+    df = pd.concat(all_close, axis=1)
+
+    # Ensure unique columns and normalized tickers
+    df.columns = [normalize_ticker(c) for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated(keep="last")]
+
+    # Sort by date and forward-fill gaps
+    df.index = pd.to_datetime(df.index, utc=True).normalize()
+    df = df.sort_index().ffill()
+
+    # Use float32 to reduce memory
+    df = df.astype("float32")
+
+    return df
 
 
 # ============================================================
 # UI
 # ============================================================
-st.title("Relative Strength Scanner (Alpha Vantage • Cached)")
+st.title("Relative Strength Scanner (yfinance • Manual Refresh)")
 st.caption(f"As of: {utc_now_label()} • Benchmark: {BENCHMARK}")
 
-if not API_KEY:
-    st.error(
-        "Missing API key.\n\n"
-        "Set **AlphaVantage_API_KEY** in Streamlit Secrets (recommended) "
-        "or set env var **ALPHAVANTAGE_API_KEY**."
-    )
-    st.stop()
+# Session state for manual refresh cache-bust
+if "refresh_id" not in st.session_state:
+    st.session_state.refresh_id = 0
 
 # Load tickers
 try:
@@ -297,28 +243,22 @@ if bench_norm not in universe:
 
 st.write(f"Universe size: **{len(universe):,}** tickers (including benchmark).")
 
-# Load cache
-meta = load_meta()
-cache_long = load_price_cache_long()
-
-cached_tickers = sorted(cache_long["ticker"].unique().tolist()) if not cache_long.empty else []
-st.write(f"Cached tickers: **{len(cached_tickers):,}**")
-
 with st.sidebar:
-    st.subheader("Cache Builder (for big universes)")
+    st.subheader("Data")
+    batch_size = st.slider("Batch size (tickers per request)", 100, 800, 400, step=50)
+    refresh = st.button("Refresh data now", use_container_width=True)
 
-    batch_size = st.slider("Update this many tickers per click", 10, 300, 60, step=10)
-    prefer_uncached = st.checkbox("Prioritize uncached tickers first", value=True)
-
-    st.caption(f"Rate limit set to ~{CALLS_PER_MINUTE}/min. (Change CALLS_PER_MINUTE in code if your AV plan allows more.)")
-
-    update_cache_btn = st.button("Update cache (batch)", use_container_width=True)
+    st.caption("Tip: If Yahoo throttles, lower batch size (e.g., 250–350).")
 
     st.divider()
     st.subheader("Scanner Controls")
-
     rs_min = st.slider("Minimum RS Rating", min_value=1, max_value=99, value=90, step=1)
-    primary_tf = st.selectbox("Primary Timeframe", list(HORIZONS.keys()), index=1)
+
+    primary_tf = st.selectbox(
+        "Primary Timeframe",
+        ["RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y"],
+        index=1
+    )
 
     mode = st.selectbox(
         "Scan Mode",
@@ -332,151 +272,135 @@ with st.sidebar:
     )
 
     max_results = st.slider("Max Results to Display", 25, 500, 200, step=25)
-    run_scan_btn = st.button("Run Scan", use_container_width=True)
 
+# If user clicks refresh, bump refresh_id to bust st.cache_data
+if refresh:
+    st.session_state.refresh_id += 1
 
-# ----------------------------
-# Cache updater
-# ----------------------------
-if update_cache_btn:
-    st.info("Updating cache… this is rate-limited. Click again later to continue building the full universe.")
+# Load cached prices from disk first (so you always have something)
+disk_df, disk_meta = load_cache()
+if not disk_df.empty:
+    st.info(f"Using saved cache until refresh completes. ({disk_meta})")
 
-    # Choose tickers to update
-    universe_norm = [normalize_ticker(t) for t in universe]
-    universe_norm = list(dict.fromkeys([t for t in universe_norm if t]))
-
-    cached_set = set(cached_tickers)
-
-    if prefer_uncached:
-        candidates = [t for t in universe_norm if t not in cached_set]
-        # If everything cached, refresh oldest updated
-        if not candidates:
-            # sort by meta updated time (oldest first)
-            def upd_ts(t):
-                v = meta.get(t, {}).get("updated_utc", "")
-                return v or "0000-00-00 00:00 UTC"
-            candidates = sorted(universe_norm, key=upd_ts)
-    else:
-        # refresh oldest first across all
-        def upd_ts(t):
-            v = meta.get(t, {}).get("updated_utc", "")
-            return v or "0000-00-00 00:00 UTC"
-        candidates = sorted(universe_norm, key=upd_ts)
-
-    todo = candidates[:batch_size]
-    st.write(f"Updating **{len(todo)}** tickers…")
-
+# If refresh was clicked, fetch fresh data and save it
+if refresh:
+    st.warning("Refreshing prices from Yahoo Finance… (this may take a bit for 6,600 tickers)")
     prog = st.progress(0)
     status = st.empty()
 
-    failures = []
-    for i, t in enumerate(todo, start=1):
-        status.write(f"Downloading {t} ({i}/{len(todo)}) …")
-        try:
-            ser = fetch_daily_adj_closes_av(t)
-            if ser is None or ser.empty:
-                failures.append(t)
-            else:
-                cache_long = upsert_ticker_into_cache(cache_long, t, ser)
-                meta[t] = {"updated_utc": utc_now_label()}
-        except Exception:
-            failures.append(t)
+    # We can’t hook into yf.download progress easily, so we do a simple visual stepper
+    # by estimating number of batches
+    batches = chunk_list(universe, batch_size)
+    total_batches = len(batches)
 
-        prog.progress(i / len(todo))
+    # Fetch in one cached function call (fastest), but show a rough progress bar
+    # Update progress “optimistically” in a loop so UI isn’t frozen
+    # (We still rely on the function doing the actual work.)
+    try:
+        # Kick the work
+        status.write(f"Downloading {len(universe):,} tickers in {total_batches} batches…")
+        df_prices = fetch_prices_yf_chunked(
+            tickers=tuple(universe),
+            batch_size=batch_size,
+            refresh_id=st.session_state.refresh_id,
+            period=PRICE_PERIOD,
+            interval=INTERVAL,
+        )
+        prog.progress(1.0)
 
-    # Save to disk
-    save_price_cache_long(cache_long)
-    save_meta(meta)
+        if df_prices.empty:
+            raise RuntimeError("Yahoo returned empty data. Try smaller batch size.")
 
-    st.success(
-        f"Cache update complete. Added/updated: {len(todo) - len(failures)} • Failed: {len(failures)}"
-    )
+        # Save to disk cache
+        save_cache(df_prices)
+        status.success(f"Refresh complete. Saved cache at {utc_now_label()}.")
+        disk_df = df_prices
 
-    if failures:
-        with st.expander("Failed tickers"):
-            st.write(", ".join(failures[:500]))
-            if len(failures) > 500:
-                st.write(f"...and {len(failures) - 500} more")
+    except Exception as e:
+        status.error(f"Refresh failed: {e}")
+        if disk_df.empty:
+            st.stop()
+        st.warning("Falling back to last saved cache.")
 
-    st.rerun()
+# Use whatever we have (fresh or disk)
+price_df = disk_df.copy()
+if price_df.empty:
+    st.error("No data available. Click Refresh data now.")
+    st.stop()
 
+# Validate benchmark
+if bench_norm not in price_df.columns:
+    st.error(f"Benchmark {BENCHMARK} missing from downloaded data. Try refresh again.")
+    st.stop()
 
-# ----------------------------
-# Run scan from cache
-# ----------------------------
-if run_scan_btn:
-    if cache_long.empty:
-        st.error("Cache is empty. Click **Update cache (batch)** first.")
-        st.stop()
+# Ensure enough history for 1Y
+min_len_needed = max(HORIZONS.values()) + 5
+usable_cols = [c for c in price_df.columns if price_df[c].dropna().shape[0] >= min_len_needed]
+if bench_norm not in usable_cols:
+    st.error(f"Benchmark {BENCHMARK} doesn’t have enough history. Try refresh again.")
+    st.stop()
 
-    price_df = build_price_matrix_from_cache(cache_long)
+price_df = price_df[usable_cols].copy()
+bench = price_df[bench_norm]
 
-    if bench_norm not in price_df.columns:
-        st.error(f"Benchmark {BENCHMARK} not found in cache yet. Update cache until it includes {bench_norm}.")
-        st.stop()
+st.write(f"Tickers with sufficient history (including benchmark): **{len(price_df.columns):,}**")
 
-    # Keep only tickers with enough history for 1Y
-    min_len_needed = max(HORIZONS.values()) + 5
-    usable_cols = []
-    for c in price_df.columns:
-        if price_df[c].dropna().shape[0] >= min_len_needed:
-            usable_cols.append(c)
+# Compute RS ratios
+rows = []
+tickers_to_score = [t for t in price_df.columns if t != bench_norm]
 
-    if bench_norm not in usable_cols:
-        st.error(f"Benchmark {BENCHMARK} does not have enough history yet in cache.")
-        st.stop()
+for t in tickers_to_score:
+    close = price_df[t]
+    rec = {"Ticker": t}
+    for col, n in HORIZONS.items():
+        rec[col] = rs_ratio(close, bench, n)
+    rows.append(rec)
 
-    price_df = price_df[usable_cols].copy()
-    bench = price_df[bench_norm]
+df = pd.DataFrame(rows)
 
-    tickers_to_score = [t for t in price_df.columns if t != bench_norm]
+# Convert each RS column to 1–99 percentile across universe
+for col in HORIZONS.keys():
+    s = pd.to_numeric(df[col], errors="coerce")
+    df[col] = (s.rank(pct=True) * 99).round().clip(1, 99)
 
-    if len(tickers_to_score) < 20:
-        st.warning("Your cache is still small. Results will improve as you build more tickers into the cache.")
+# Apply scan filters
+if mode == "Primary timeframe only":
+    df_f = df[df[primary_tf] >= rs_min].copy()
 
-    rows = []
-    for t in tickers_to_score:
-        close = price_df[t]
-        rec = {"Ticker": t}
-        for col, n in HORIZONS.items():
-            rec[col] = rs_ratio(close, bench, n)
-        rows.append(rec)
-
-    df = pd.DataFrame(rows)
-
-    # percentile -> 1..99 across cached universe (NOT the full 6600 yet)
+elif mode == "All timeframes >= threshold":
+    cond = True
     for col in HORIZONS.keys():
-        s = pd.to_numeric(df[col], errors="coerce")
-        df[col] = (s.rank(pct=True) * 99).round().clip(1, 99)
+        cond = cond & (df[col] >= rs_min)
+    df_f = df[cond].copy()
 
-    # filters
-    if mode == "Primary timeframe only":
-        df_f = df[df[primary_tf] >= rs_min].copy()
+elif mode == "Accelerating (RS 1Y → RS 1W improving)":
+    df_f = df[(df["RS 1W"] > df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
 
-    elif mode == "All timeframes >= threshold":
-        cond = True
-        for col in HORIZONS.keys():
-            cond = cond & (df[col] >= rs_min)
-        df_f = df[cond].copy()
+else:  # Decelerating
+    df_f = df[(df["RS 1W"] < df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
 
-    elif mode == "Accelerating (RS 1Y → RS 1W improving)":
-        df_f = df[(df["RS 1W"] > df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
+df_f = df_f.sort_values([primary_tf, "RS 1Y"], ascending=[False, False])
 
-    else:  # Decelerating
-        df_f = df[(df["RS 1W"] < df["RS 1Y"]) & (df[primary_tf] >= rs_min)].copy()
+st.success(f"Scan complete • {len(df_f):,} matches")
 
-    df_f = df_f.sort_values([primary_tf, "RS 1Y"], ascending=[False, False])
-    df_show = df_f.head(max_results).reset_index(drop=True)
+df_show = df_f.head(max_results).reset_index(drop=True)
+st.dataframe(df_show, use_container_width=True, height=720)
 
-    st.success(f"Scan complete • Cached universe scored: {len(df):,} • Matches: {len(df_f):,}")
-    st.dataframe(df_show, use_container_width=True, height=700)
-
-    st.markdown(
-        """
-**Important**  
-- RS 1–99 is computed across your **cached tickers**, not your full 6,600, until the cache is fully built.  
-- Click **Update cache (batch)** repeatedly over time to grow coverage.  
-- Free Alpha Vantage will take many hours to fully populate 6,600 tickers.
+st.markdown(
+    """
+**How ranking works**  
+- Each stock is compared to **SPY** over each timeframe (1W/1M/3M/6M/1Y).  
+- Those relative-performance values are percentile-ranked **across your universe** into **RS 1–99**.  
+- RS 99 ≈ “top ~1% of your list” for that timeframe.
 """
+)
+
+with st.expander("Troubleshooting / Tuning"):
+    st.write(
+        "- If refresh fails or is slow: lower **batch size** (try 250–350).\n"
+        "- Yahoo can throttle randomly. This app keeps the last saved cache so you don’t lose the dashboard.\n"
+        "- If a few symbols don’t return data, that’s normal with Yahoo; they’ll be excluded from scoring.\n"
+        "- Want it even faster? Set PRICE_PERIOD to '1y' once you’re comfortable (still enough for RS 1Y if trading days are present).\n"
     )
+
 
